@@ -1,0 +1,13 @@
+*.jou
+*.log
+*.str
+
+*.xsa
+
+*.cache/
+*.gen/
+*.hw/
+*.runs/
+*.ip_user_files/
+
+.vscode/

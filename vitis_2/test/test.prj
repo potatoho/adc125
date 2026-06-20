@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="test" location="C:/Users/annoa/FL9627/project2_try1/vitis_2/test" platform="C:/Users/annoa/FL9627/project2_try1/vitis_2/top/export/top/top.xpfm" platformUID="xilinx:zcu104::0.0(custom)" systemProject="test_system" sysConfig="top" runtime="cpp" cpu="standalone_psu_cortexa53_0" cpuInstance="psu_cortexa53_0" os="standalone" mssSignature="0ea0dec7ad17c99424d03bfb847d2560">
+  <configuration name="Debug" id="xilinx.gnu.arm.a53.exe.debug.1318199968">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.arm.a53.exe.release.351116491" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="lwip_echo_server" hasBspSettings="true"/>
+</sdkproject:SdkProject>
