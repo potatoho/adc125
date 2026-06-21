@@ -1,5 +1,3 @@
-//not perfect maybe 
-
 module top(
     input                     sys_clk_p,
     input                     sys_clk_n,
@@ -26,7 +24,12 @@ module top(
 
 wire clk_50m;
 wire clk_125m;
+wire clk_200m;
 wire locked;
+wire idelayctrl_rdy;
+
+reg [3:0] idelay_rst_sync = 4'b1111;
+wire idelayctrl_rst = idelay_rst_sync[3];
 
 wire [9:0]  adc1_lut_index;
 wire [24:0] adc1_lut_data;
@@ -42,6 +45,7 @@ wire adc2_clk_io;
 wire adc2_clk_fabric;
 
 wire [11:0] adc1_data_ibuf;
+wire [11:0] adc1_data_delay;
 wire [11:0] adc2_data_ibuf;
 
 (* mark_debug = "true" *) wire [11:0] adc1_data_a;
@@ -76,12 +80,38 @@ clk_wiz_0 sys_pll_m0 (
     .clk_in1_n (sys_clk_n),
     .clk_out1  (clk_50m),
     .clk_out2  (clk_125m),
+    .clk_out3  (clk_200m), // IDELAYCTRL 및 IDELAYE3 제어용 200MHz
     .locked    (locked)
 );
 
 
 // ============================================================
-// ADC1 DCO input clock
+// IDELAYCTRL reset sync to clk_200m
+// ============================================================
+
+always @(posedge clk_200m or negedge locked) begin
+    if (!locked)
+        idelay_rst_sync <= 4'b1111;
+    else
+        idelay_rst_sync <= {idelay_rst_sync[2:0], 1'b0};
+end
+
+
+// ============================================================
+// IDELAYCTRL
+// ============================================================
+
+IDELAYCTRL #(
+    .SIM_DEVICE("ULTRASCALE")
+) IDELAYCTRL_inst (
+    .RDY    (idelayctrl_rdy),
+    .REFCLK (clk_200m),
+    .RST    (idelayctrl_rst)
+);
+
+
+// ============================================================
+// ADC1 DCO input clock (BUFIO와 BUFG 병렬 유지)
 // ============================================================
 
 IBUFDS #(
@@ -96,17 +126,17 @@ IBUFDS #(
 
 BUFIO BUFIO_adc1_clk (
     .I (adc1_clk_ibuf),
-    .O (adc1_clk_io)
+    .O (adc1_clk_io)      // IDDRE1.C 수신용 고속 로컬 클럭
 );
 
 BUFG BUFG_adc1_clk (
     .I (adc1_clk_ibuf),
-    .O (adc1_clk_fabric)
+    .O (adc1_clk_fabric)  // fabric 레지스터 동기화용 글로벌 클럭
 );
 
 
 // ============================================================
-// ADC2 DCO input clock
+// ADC2 DCO input clock (BUFIO와 BUFG 병렬 유지)
 // ============================================================
 
 IBUFDS #(
@@ -121,22 +151,26 @@ IBUFDS #(
 
 BUFIO BUFIO_adc2_clk (
     .I (adc2_clk_ibuf),
-    .O (adc2_clk_io)
+    .O (adc2_clk_io)      // IDDRE1.C 수신용 고속 로컬 클럭
 );
 
 BUFG BUFG_adc2_clk (
     .I (adc2_clk_ibuf),
-    .O (adc2_clk_fabric)
+    .O (adc2_clk_fabric)  // fabric 레지스터 동기화용 글로벌 클럭
 );
 
+
 // ============================================================
-// ADC LVDS data input + IDDR
+// ADC LVDS data input + IDELAYE3 정정 + IDDRE1
 // ============================================================
 
 genvar i;
 generate
 for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
 
+    // --------------------------------------------------------
+    // ADC1 채널: IBUFDS -> IDELAYE3(IDATAIN) -> IDDRE1.D
+    // --------------------------------------------------------
     IBUFDS #(
         .DIFF_TERM("TRUE"),
         .IBUF_LOW_PWR("FALSE"),
@@ -147,21 +181,50 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
         .IB (adc1_data_n[i])
     );
 
-    IDDR #(
-        .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
-        .INIT_Q1(1'b0),
-        .INIT_Q2(1'b0),
-        .SRTYPE("ASYNC")
-    ) IDDR_adc1_data (
-        .Q1 (adc1_data_b[i]),
-        .Q2 (adc1_data_a[i]),
-        .C  (adc1_clk_io),
-        .CE (1'b1),
-        .D  (adc1_data_ibuf[i]),
-        .R  (1'b0),
-        .S  (1'b0)
+    IDELAYE3 #(
+        .CASCADE("NONE"),
+        .DELAY_FORMAT("TIME"),
+        .DELAY_SRC("IDATAIN"),          // 정정: 외부 입력이므로 IDATAIN 설정
+        .DELAY_TYPE("FIXED"),
+        .DELAY_VALUE(300),              // 정정: 변별력 있는 비교를 위해 300ps 인위적 추가
+        .IS_CLK_INVERTED(1'b0),
+        .IS_RST_INVERTED(1'b0),
+        .REFCLK_FREQUENCY(200.0),
+        .SIM_DEVICE("ULTRASCALE_PLUS"),
+        .UPDATE_MODE("ASYNC")
+    ) IDELAYE3_adc1_data (
+        .CASC_IN      (1'b0),
+        .CASC_OUT     (),
+        .CASC_RETURN  (1'b0),
+        .CE           (1'b0),
+        .CLK          (clk_200m),       // 정정: 안정을 위해 제어 클럭도 200MHz로 통일
+        .CNTVALUEOUT  (),
+        .CNTVALUEIN   (9'd0),
+        .DATAIN       (1'b0),           // 정정: DATAIN은 0 바인딩
+        .EN_VTC(1'b1),
+        .IDATAIN      (adc1_data_ibuf[i]), // 정정: 외부 입력 신호는 여기로 연결
+        .INC          (1'b0),
+        .LOAD         (1'b0),
+        .RST          (idelayctrl_rst),
+        .DATAOUT      (adc1_data_delay[i])
     );
 
+    IDDRE1 #(
+        .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
+        .IS_CB_INVERTED(1'b1),
+        .IS_C_INVERTED(1'b0)
+    ) IDDRE1_adc1_data (
+        .Q1 (adc1_data_a[i]),
+        .Q2 (adc1_data_b[i]),
+        .C  (adc1_clk_io),              // 정정: BUFIO에서 나온 고속 클럭 연결
+        .CB (adc1_clk_io),
+        .D  (adc1_data_delay[i]),
+        .R  (1'b0)
+    );
+
+    // --------------------------------------------------------
+    // ADC2 채널: IBUFDS -> IDDRE1.D (기존 안정 구조 유지)
+    // --------------------------------------------------------
     IBUFDS #(
         .DIFF_TERM("TRUE"),
         .IBUF_LOW_PWR("FALSE"),
@@ -172,19 +235,17 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
         .IB (adc2_data_n[i])
     );
 
-    IDDR #(
+    IDDRE1 #(
         .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
-        .INIT_Q1(1'b0),
-        .INIT_Q2(1'b0),
-        .SRTYPE("ASYNC")
-    ) IDDR_adc2_data (
+        .IS_CB_INVERTED(1'b1),
+        .IS_C_INVERTED(1'b0)
+    ) IDDRE1_adc2_data (
         .Q1 (adc2_data_b[i]),
         .Q2 (adc2_data_a[i]),
-        .C  (adc2_clk_io),
-        .CE (1'b1),
+        .C  (adc2_clk_io),              // 정정: BUFIO에서 나온 고속 클럭 연결
+        .CB (adc2_clk_io),
         .D  (adc2_data_ibuf[i]),
-        .R  (1'b0),
-        .S  (1'b0)
+        .R  (1'b0)
     );
 
 end
@@ -192,7 +253,7 @@ endgenerate
 
 
 // ============================================================
-// ADC fabric-domain registers
+// ADC fabric-domain registers (BUFG 클럭 도메인 수신)
 // ============================================================
 
 always @(posedge adc1_clk_fabric) begin
