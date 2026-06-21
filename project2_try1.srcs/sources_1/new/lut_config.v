@@ -40,7 +40,7 @@ always @(*) begin
 
         // 0x18: VREF
         // internal reference 기본값 명시
-        10'd8: lut_data <= {16'h0018, 8'h00};
+        10'd8: lut_data <= {16'h0018, 8'hC0};
 
         // 0xFF: transfer
         // shadow register update
