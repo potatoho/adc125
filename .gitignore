@@ -1,0 +1,35 @@
+# Vivado
+*.jou
+*.log
+*.str
+.Xil/
+*.cache/
+*.gen/
+*.runs/
+*.sim/
+*.hw/
+*.ip_user_files/
+
+# Vitis
+.vitis/
+Debug/
+Release/
+
+# Vitis workspace/generated files
+vitis/.metadata/
+vitis/**/Debug/
+vitis/**/Release/
+vitis/**/bsp/
+vitis/**/*_bsp/
+vitis/**/libsrc/
+
+# Vitis generated outputs
+vitis/**/hw/
+vitis/**/resources/
+vitis/**/zynqmp_fsbl/
+vitis/**/zynqmp_pmufw/
+*.elf
+*.bit
+*.mmi
+*.spr
+*.sprj
