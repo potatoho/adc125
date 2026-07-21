@@ -25,9 +25,11 @@ module top(
     input  [11:0]             adc2_data_n
 );
 
+wire [31:0] control;
+
 wire clk_50m;
 wire clk_125m;
-wire clk_200m;
+wire clk_300m;
 wire locked;
 wire idelayctrl_rdy;
 
@@ -50,6 +52,7 @@ wire adc2_clk_fabric;
 wire [11:0] adc1_data_ibuf;
 wire [11:0] adc1_data_delay;
 wire [11:0] adc2_data_ibuf;
+wire [11:0] adc2_data_delay;
 
 (* mark_debug = "true" *) wire [11:0] adc1_data_a;
 (* mark_debug = "true" *) wire [11:0] adc1_data_b;
@@ -69,6 +72,16 @@ wire        m_axis_tlast;
 
 wire        axis_aclk;
 wire        axis_aresetn;
+wire        adc_dma_rst;
+
+wire [31:0] frame_size;
+wire [31:0] pretrigger_size;
+wire [31:0] sample_decimation;
+wire [31:0] trigger_cfg;
+wire [31:0] self_threshold;
+wire [31:0] channel_mask;
+
+assign adc_dma_rst = (~axis_aresetn) | (~idelayctrl_rdy);
 
 assign adc1_clk_ref = clk_125m;
 assign adc2_clk_ref = clk_125m;
@@ -83,16 +96,16 @@ clk_wiz_0 sys_pll_m0 (
     .clk_in1_n (sys_clk_n),
     .clk_out1  (clk_50m),
     .clk_out2  (clk_125m),
-    .clk_out3  (clk_200m), // IDELAYCTRL 및 IDELAYE3 제어용 200MHz
+    .clk_out3  (clk_300m), // IDELAYCTRL 및 IDELAYE3 제어용 300MHz
     .locked    (locked)
 );
 
 
 // ============================================================
-// IDELAYCTRL reset sync to clk_200m
+// IDELAYCTRL reset sync to clk_300m
 // ============================================================
 
-always @(posedge clk_200m or negedge locked) begin
+always @(posedge clk_300m or negedge locked) begin
     if (!locked)
         idelay_rst_sync <= 4'b1111;
     else
@@ -108,7 +121,7 @@ IDELAYCTRL #(
     .SIM_DEVICE("ULTRASCALE")
 ) IDELAYCTRL_inst (
     .RDY    (idelayctrl_rdy),
-    .REFCLK (clk_200m),
+    .REFCLK (clk_300m),
     .RST    (idelayctrl_rst)
 );
 
@@ -189,10 +202,10 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
         .DELAY_FORMAT("TIME"),
         .DELAY_SRC("IDATAIN"),          // 정정: 외부 입력이므로 IDATAIN 설정
         .DELAY_TYPE("FIXED"),
-        .DELAY_VALUE(700),              // 정정: 변별력 있는 비교를 위해 300ps 인위적 추가
+        .DELAY_VALUE(1000),              // ADC1 input delay: 800 ps
         .IS_CLK_INVERTED(1'b0),
         .IS_RST_INVERTED(1'b0),
-        .REFCLK_FREQUENCY(200.0),
+        .REFCLK_FREQUENCY(300.0),
         .SIM_DEVICE("ULTRASCALE_PLUS"),
         .UPDATE_MODE("ASYNC")
     ) IDELAYE3_adc1_data (
@@ -200,7 +213,7 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
         .CASC_OUT     (),
         .CASC_RETURN  (1'b0),
         .CE           (1'b0),
-        .CLK          (clk_200m),       // 정정: 안정을 위해 제어 클럭도 200MHz로 통일
+        .CLK          (clk_300m),       // 정정: 안정을 위해 제어 클럭도 300MHz로 통일
         .CNTVALUEOUT  (),
         .CNTVALUEIN   (9'd0),
         .DATAIN       (1'b0),           // 정정: DATAIN은 0 바인딩
@@ -226,7 +239,7 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
     );
 
     // --------------------------------------------------------
-    // ADC2 채널: IBUFDS -> IDDRE1.D (기존 안정 구조 유지)
+    // ADC2 채널: IBUFDS -> IDELAYE3(IDATAIN) -> IDDRE1.D
     // --------------------------------------------------------
     IBUFDS #(
         .DIFF_TERM("TRUE"),
@@ -238,6 +251,34 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
         .IB (adc2_data_n[i])
     );
 
+    IDELAYE3 #(
+        .CASCADE("NONE"),
+        .DELAY_FORMAT("TIME"),
+        .DELAY_SRC("IDATAIN"),
+        .DELAY_TYPE("FIXED"),
+        .DELAY_VALUE(550),              // ADC2 input delay: 300 ps
+        .IS_CLK_INVERTED(1'b0),
+        .IS_RST_INVERTED(1'b0),
+        .REFCLK_FREQUENCY(300.0),
+        .SIM_DEVICE("ULTRASCALE_PLUS"),
+        .UPDATE_MODE("ASYNC")
+    ) IDELAYE3_adc2_data (
+        .CASC_IN      (1'b0),
+        .CASC_OUT     (),
+        .CASC_RETURN  (1'b0),
+        .CE           (1'b0),
+        .CLK          (clk_300m),
+        .CNTVALUEOUT  (),
+        .CNTVALUEIN   (9'd0),
+        .DATAIN       (1'b0),
+        .EN_VTC       (1'b1),
+        .IDATAIN      (adc2_data_ibuf[i]),
+        .INC          (1'b0),
+        .LOAD         (1'b0),
+        .RST          (idelayctrl_rst),
+        .DATAOUT      (adc2_data_delay[i])
+    );
+
     IDDRE1 #(
         .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
         .IS_CB_INVERTED(1'b1),
@@ -245,9 +286,9 @@ for (i = 0; i < 12; i = i + 1) begin : GEN_ADC_INPUTS
     ) IDDRE1_adc2_data (
         .Q1 (adc2_data_b[i]),
         .Q2 (adc2_data_a[i]),
-        .C  (adc2_clk_io),              // 정정: BUFIO에서 나온 고속 클럭 연결
+        .C  (adc2_clk_io),
         .CB (adc2_clk_io),
-        .D  (adc2_data_ibuf[i]),
+        .D  (adc2_data_delay[i]),
         .R  (1'b0)
     );
 
@@ -260,13 +301,23 @@ endgenerate
 // ============================================================
 
 always @(posedge adc1_clk_fabric) begin
-    adc1_data_a_d0 <= adc1_data_a;
-    adc1_data_b_d0 <= adc1_data_b;
+    if (!idelayctrl_rdy) begin
+        adc1_data_a_d0 <= 12'd0;
+        adc1_data_b_d0 <= 12'd0;
+    end else begin
+        adc1_data_a_d0 <= adc1_data_a;
+        adc1_data_b_d0 <= adc1_data_b;
+    end
 end
 
 always @(posedge adc2_clk_fabric) begin
-    adc2_data_a_d0 <= adc2_data_a;
-    adc2_data_b_d0 <= adc2_data_b;
+    if (!idelayctrl_rdy) begin
+        adc2_data_a_d0 <= 12'd0;
+        adc2_data_b_d0 <= 12'd0;
+    end else begin
+        adc2_data_a_d0 <= adc2_data_a;
+        adc2_data_b_d0 <= adc2_data_b;
+    end
 end
 
 
@@ -318,7 +369,7 @@ spi_config spi_config_adc2 (
 // ============================================================
 
 adc_dma_wrapper adc_dma_wrapper_inst (
-    .rst            (~axis_aresetn),
+    .rst            (adc_dma_rst),
 
     .adc1_clk       (adc1_clk_fabric),
     .adc1_data_a    (adc1_data_a_d0),
@@ -329,6 +380,13 @@ adc_dma_wrapper adc_dma_wrapper_inst (
     .adc2_data_b    (adc2_data_b_d0),
 
     .trigger_in     (trigger_in),
+    .control        (control),
+    .frame_size          (frame_size),
+    .pretrigger_size     (pretrigger_size),
+    .sample_decimation   (sample_decimation),
+    .trigger_cfg         (trigger_cfg),
+    .self_threshold      (self_threshold),
+    .channel_mask        (channel_mask),
 
     .m_axis_aclk    (axis_aclk),
     .m_axis_aresetn (axis_aresetn),
@@ -344,14 +402,23 @@ adc_dma_wrapper adc_dma_wrapper_inst (
 // PS / AXI
 // ============================================================
 
-design_1_wrapper design_1_i (
-    .S_AXIS_ADC_tdata   (m_axis_tdata),
-    .S_AXIS_ADC_tlast   (m_axis_tlast),
-    .S_AXIS_ADC_tready  (m_axis_tready),
-    .S_AXIS_ADC_tvalid  (m_axis_tvalid),
 
-    .axis_aresetn       (axis_aresetn),
-    .pl_clk0            (axis_aclk)
+
+design_1_wrapper design_1_i (
+    .S_AXIS_ADC_tdata      (m_axis_tdata),
+    .S_AXIS_ADC_tlast      (m_axis_tlast),
+    .S_AXIS_ADC_tready     (m_axis_tready),
+    .S_AXIS_ADC_tvalid     (m_axis_tvalid),
+
+    .axis_aresetn          (axis_aresetn),
+    .channel_mask          (channel_mask),
+    .control               (control),
+    .frame_size            (frame_size),
+    .pl_clk0               (axis_aclk),
+    .pretrigger_size       (pretrigger_size),
+    .sample_decimation     (sample_decimation),
+    .self_threshold        (self_threshold),
+    .trigger_cfg           (trigger_cfg)
 );
 
 endmodule

@@ -1,0 +1,12 @@
+timestamp=[2026-07-14 23:15:23], mode=WORKBENCH_START, duration=0:00:08.678, duration_ms=8678, data={}
+timestamp=[2026-07-14 23:15:24], mode=WORKBENCH_UI_INIT, duration=0:00:00.837, duration_ms=837, data={editors_count=0, platform_editors_count=0, projects_count=0, platform_projects_count=0, active_platform_editor=false, projects=}
+timestamp=[2026-07-14 23:15:26], mode=PLATFORM_REPOSITORY_INIT, duration=0:00:01.256, duration_ms=1256, data={}
+timestamp=[2026-07-14 23:17:54], mode=APP_CREATION, duration=0:00:39.756, duration_ms=39756, data={name=test, project_type=sdk, os=standalone, processor=psu_cortexa53, runtime=cpp, platform=top_footer, application_type=application}
+timestamp=[2026-07-14 23:20:35], mode=PLATFORM_GENERATION, duration=0:01:46.507, duration_ms=106507, data={name=top_footer}
+timestamp=[2026-07-14 23:20:41], mode=BUILD, duration=0:00:06.071, duration_ms=6071, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2026-07-14 23:20:54], mode=BUILD, duration=0:00:11.655, duration_ms=11655, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2026-07-15 08:51:06], mode=WORKBENCH_START, duration=0:00:10.338, duration_ms=10338, data={}
+timestamp=[2026-07-15 08:51:07], mode=WORKBENCH_UI_INIT, duration=0:00:01.406, duration_ms=1406, data={editors_count=4, platform_editors_count=1, projects_count=4, platform_projects_count=1, active_platform_editor=true, projects=RemoteSystemsTempFiles,test,test_system,top_footer}
+timestamp=[2026-07-15 08:51:09], mode=PLATFORM_REPOSITORY_INIT, duration=0:00:02.347, duration_ms=2347, data={}
+timestamp=[2026-07-15 08:51:38], mode=BUILD, duration=0:00:01.420, duration_ms=1420, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2026-07-15 08:51:46], mode=BUILD, duration=0:00:07.884, duration_ms=7884, data={name=test_system, configuration=Debug, clean_build=false}

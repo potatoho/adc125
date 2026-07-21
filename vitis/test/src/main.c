@@ -6,6 +6,7 @@
 #include "xstatus.h"
 #include "xaxidma.h"
 #include "xil_cache.h"
+#include "xil_io.h"
 #include "xil_printf.h"
 #include "sleep.h"
 
@@ -22,123 +23,197 @@
 #include "lwip/inet.h"
 #include "lwip/etharp.h"
 
+/*
+ * Final Vitis application for:
+ *
+ *   adc_ctrl register outputs:
+ *     reg0  control
+ *     reg2  frame_size
+ *     reg3  pretrigger_size
+ *     reg4  sample_decimation
+ *     reg5  trigger_cfg
+ *     reg6  self_threshold
+ *     reg7  channel_mask
+ *     reg8  output_cfg
+ *     reg9  baseline_shift
+ *
+ * Data path:
+ *   PL trigger buffer -> AXI DMA S2MM -> DDR -> UDP to PC
+ *
+ * Control path:
+ *   PC UDP command port 5001 -> adc_ctrl AXI4-Lite writes/reads
+ */
 
 /* ============================================================
- * DMA 설정
+ * DMA configuration
  * ============================================================ */
 
-#define DMA_DEV_ID             XPAR_AXIDMA_0_DEVICE_ID
+#define DMA_DEV_ID                      XPAR_AXIDMA_0_DEVICE_ID
 
-#define FRAME_WORDS            131072U
-#define FRAME_BYTES            (FRAME_WORDS * 8U)
+#define MAX_FRAME_WORDS                 131072U
+#define MIN_FRAME_WORDS                 1U
 
-/* 전송 완료 후 다음 DMA를 arm하기 전까지의 트리거 무시 시간 */
-#define TRIGGER_HOLDOFF_SECONDS 10U
+#define PL_FOOTER_WORDS                 10U
+
+#define MAX_DMA_WORDS                   (MAX_FRAME_WORDS + PL_FOOTER_WORDS)
+#define MAX_DMA_BYTES                   (MAX_DMA_WORDS * 8U)
 
 /*
- * 두 수신 버퍼는 충분히 떨어진 DDR 주소에 배치
- *
- * Buffer 0: 0x10000000 ~ 0x1007FFFF
- * Buffer 1: 0x10100000 ~ 0x1017FFFF
+ * The footer adds 80 bytes when frame_size is 131072 words.
+ * Therefore the two ping-pong buffers must be spaced by more than 1 MiB.
  */
-#define RX_BUFFER0_BASE        0x10000000U
-#define RX_BUFFER1_BASE        0x10100000U
-
-
-/* ============================================================
- * 보드 Ethernet 설정
- * ============================================================ */
-
-#define BOARD_IP0              10
-#define BOARD_IP1              0
-#define BOARD_IP2              147
-#define BOARD_IP3              27
-
-#define BOARD_NETMASK0         255
-#define BOARD_NETMASK1         255
-#define BOARD_NETMASK2         255
-#define BOARD_NETMASK3         0
-
-#define BOARD_GATEWAY0         10
-#define BOARD_GATEWAY1         0
-#define BOARD_GATEWAY2         147
-#define BOARD_GATEWAY3         99
-
+#define RX_BUFFER0_BASE                 0x10000000U
+#define RX_BUFFER1_BASE                 0x10200000U
 
 /* ============================================================
- * PC UDP 목적지 설정
- *
- * 실제 PC IP에 맞게 수정
+ * Ethernet configuration
  * ============================================================ */
 
-#define PC_IP0                 10
-#define PC_IP1                 0
-#define PC_IP2                 147
-#define PC_IP3                 72
+#define BOARD_IP0                       10
+#define BOARD_IP1                       0
+#define BOARD_IP2                       147
+#define BOARD_IP3                       27
 
-#define PC_UDP_PORT            5000U
+#define BOARD_NETMASK0                  255
+#define BOARD_NETMASK1                  255
+#define BOARD_NETMASK2                  255
+#define BOARD_NETMASK3                  0
 
+#define BOARD_GATEWAY0                  10
+#define BOARD_GATEWAY1                  0
+#define BOARD_GATEWAY2                  147
+#define BOARD_GATEWAY3                  99
+
+#define PC_IP0                          10
+#define PC_IP1                          0
+#define PC_IP2                          147
+#define PC_IP3                          72
+
+#define PC_UDP_PORT                     5000U
+#define CONTROL_UDP_PORT                5001U
 
 /* ============================================================
- * UDP 패킷 설정
+ * adc_ctrl register map
  * ============================================================ */
+
+#ifndef XPAR_ADC_CTRL_0_S00_AXI_BASEADDR
+#error "XPAR_ADC_CTRL_0_S00_AXI_BASEADDR is not defined. Regenerate BSP from the latest XSA."
+#endif
+
+#define ADC_CTRL_BASEADDR               XPAR_ADC_CTRL_0_S00_AXI_BASEADDR
+
+#define ADC_CTRL_REG_CONTROL            0U
+#define ADC_CTRL_REG_FRAME_SIZE         2U
+#define ADC_CTRL_REG_PRETRIGGER_SIZE    3U
+#define ADC_CTRL_REG_SAMPLE_DECIMATION  4U
+#define ADC_CTRL_REG_TRIGGER_CFG        5U
+#define ADC_CTRL_REG_SELF_THRESHOLD     6U
+#define ADC_CTRL_REG_CHANNEL_MASK       7U
+#define ADC_CTRL_REG_OUTPUT_CFG         8U
+#define ADC_CTRL_REG_BASELINE_SHIFT     9U
+
+#define ADC_CTRL_MAX_REG                9U
+
+#define DEFAULT_FRAME_WORDS             MAX_FRAME_WORDS
+#define DEFAULT_PRETRIGGER_WORDS        16384U
+#define DEFAULT_SAMPLE_DECIMATION       1U
+#define DEFAULT_TRIGGER_CFG             1U
+#define DEFAULT_SELF_THRESHOLD          2048U
 
 /*
- * Ethernet MTU = 일반적으로 1500 bytes
+ * channel_mask:
+ *   bits [3:0] = self-trigger mask
+ *   bits [7:4] = output channel mask
  *
- * Custom header : 20 bytes
- * ADC payload   : 최대 1400 bytes
- * UDP header    : 8 bytes
- * IPv4 header   : 20 bytes
- *
- * 총 IP packet:
- * 20 + 8 + 20 + 1400 = 1448 bytes
+ * 0x0F keeps old behavior: all channels selected.
  */
-#define UDP_ADC_PAYLOAD_BYTES  1400U
+#define DEFAULT_CHANNEL_MASK            0x0000000FU
 
-/* 64K 프레임 연속 송신 시 GEM/lwIP TX 큐 고갈 방지 */
-#define UDP_TX_RETRY_COUNT     1000U
-#define UDP_TX_RETRY_DELAY_US  100U
-#define UDP_PACKET_GAP_US      50U
+/*
+ * output_cfg:
+ *   bit0 = baseline-corrected waveform enable
+ *   bit1 = append 10-word footer
+ *   bit2 = output channel masking enable
+ *
+ * If the PL footer logic is not implemented yet, set this default to 0.
+ */
+#define OUTPUT_CFG_BASELINE_CORRECT     0x00000001U
+#define OUTPUT_CFG_APPEND_FOOTER        0x00000002U
+#define OUTPUT_CFG_MASK_OUTPUT_CHANNEL  0x00000004U
 
-#define UDP_MAGIC              0xADC64096U
-
-#define TOTAL_UDP_PACKETS      \
-    ((FRAME_BYTES + UDP_ADC_PAYLOAD_BYTES - 1U) / \
-     UDP_ADC_PAYLOAD_BYTES)
-
+#define DEFAULT_OUTPUT_CFG              OUTPUT_CFG_APPEND_FOOTER
+#define DEFAULT_BASELINE_SHIFT          10U
 
 /* ============================================================
- * UDP 사용자 헤더
- *
- * 모든 헤더 값은 Network byte order로 전송
- * ADC payload는 DMA 메모리의 little-endian 원본 그대로 전송
+ * UDP protocol
  * ============================================================ */
+
+#define UDP_ADC_PAYLOAD_BYTES           1400U
+
+#define UDP_TX_RETRY_COUNT              10000U
+#define UDP_TX_RETRY_DELAY_US           100U
+#define UDP_PACKET_GAP_US               20U
+
+#define UDP_MAGIC                       0xADC64096U
+
+#define CTRL_CMD_MAGIC                  0x4354524CU  /* CTRL */
+#define CTRL_REPLY_MAGIC                0x43545252U  /* CTRR */
+
+#define CTRL_OP_READ                    1U
+#define CTRL_OP_WRITE                   2U
+#define CTRL_OP_DUMP                    3U
+
+#define CTRL_STATUS_OK                  0U
+#define CTRL_STATUS_BAD_OP              1U
+#define CTRL_STATUS_BAD_REG             2U
+#define CTRL_STATUS_BAD_LEN             3U
+
+#define DMA_WAIT_RECONFIGURE            2
 
 typedef struct __attribute__((packed))
 {
     uint32_t magic;
     uint32_t frame_id;
-
     uint16_t packet_index;
     uint16_t total_packets;
-
     uint16_t payload_bytes;
     uint16_t reserved;
-
     uint32_t frame_bytes;
-
 } UdpAdcHeader;
 
+typedef struct __attribute__((packed))
+{
+    uint32_t magic;
+    uint32_t seq;
+    uint16_t op;
+    uint16_t reg;
+    uint32_t value;
+} ControlCommand;
 
-#define UDP_HEADER_BYTES       ((uint32_t)sizeof(UdpAdcHeader))
+typedef struct __attribute__((packed))
+{
+    uint32_t magic;
+    uint32_t seq;
+    uint16_t status;
+    uint16_t reg;
+    uint32_t value;
 
-#define UDP_PACKET_BYTES       \
-    (UDP_HEADER_BYTES + UDP_ADC_PAYLOAD_BYTES)
+    uint32_t control;
+    uint32_t frame_size;
+    uint32_t pretrigger_size;
+    uint32_t sample_decimation;
+    uint32_t trigger_cfg;
+    uint32_t self_threshold;
+    uint32_t channel_mask;
+    uint32_t output_cfg;
+    uint32_t baseline_shift;
+} ControlReply;
 
+#define UDP_HEADER_BYTES                ((uint32_t)sizeof(UdpAdcHeader))
+#define UDP_PACKET_BYTES                (UDP_HEADER_BYTES + UDP_ADC_PAYLOAD_BYTES)
 
 /* ============================================================
- * 전역 객체
+ * Global objects
  * ============================================================ */
 
 static XAxiDma AxiDma;
@@ -151,31 +226,31 @@ static uint64_t *RxBuffer[2] =
 
 static struct netif ServerNetif;
 struct netif *echo_netif;
+
 static struct udp_pcb *UdpPcb;
+static struct udp_pcb *ControlUdpPcb;
 static ip_addr_t PcIpAddr;
 
 static uint32_t FrameId = 0U;
 
-/*
- * UDP 패킷 임시 조립 버퍼
- *
- * 함수 내부 stack 사용을 피하기 위해 전역으로 선언
- */
+static volatile int PendingFrameSizeValid = 0;
+static volatile uint32_t PendingFrameSizeWords = DEFAULT_FRAME_WORDS;
+
+static volatile int PendingOutputCfgValid = 0;
+static volatile uint32_t PendingOutputCfg = DEFAULT_OUTPUT_CFG;
+
+static volatile int PendingSampleDecimationValid = 0;
+static volatile uint32_t PendingSampleDecimation = DEFAULT_SAMPLE_DECIMATION;
+
+static volatile int ReconfigureRequested = 0;
+
 static uint8_t UdpPacketBuffer[UDP_PACKET_BYTES];
-
-
-/* ============================================================
- * Xilinx platform timer flag
- * ============================================================ */
 
 extern volatile int TcpFastTmrFlag;
 extern volatile int TcpSlowTmrFlag;
 
-
 /* ============================================================
- * 네트워크 처리
- *
- * DMA 대기 중과 UDP 전송 중 모두 반복 호출
+ * Network service
  * ============================================================ */
 
 static void service_network(void)
@@ -195,38 +270,7 @@ static void service_network(void)
     xemacif_input(echo_netif);
 }
 
-
-/* ============================================================
- * 트리거 holdoff 대기
- *
- * 이 함수가 실행되는 동안에는 다음 DMA를 시작하지 않는다.
- * Ethernet 처리가 멈추지 않도록 1 ms 단위로 나누어 대기한다.
- * ============================================================ */
-
-static void wait_trigger_holdoff(void)
-{
-    uint32_t elapsed_ms;
-    const uint32_t holdoff_ms =
-        TRIGGER_HOLDOFF_SECONDS * 1000U;
-
-    for (elapsed_ms = 0U;
-         elapsed_ms < holdoff_ms;
-         elapsed_ms++)
-    {
-        service_network();
-        usleep(1000U);
-    }
-}
-
-
-/* ============================================================
- * IP 주소 출력
- * ============================================================ */
-
-static void print_ip_address(
-    const char *message,
-    const ip_addr_t *ip
-)
+static void print_ip_address(const char *message, const ip_addr_t *ip)
 {
     xil_printf(
         "%s%d.%d.%d.%d\r\n",
@@ -238,9 +282,469 @@ static void print_ip_address(
     );
 }
 
+/* ============================================================
+ * adc_ctrl AXI4-Lite access
+ * ============================================================ */
+
+static uint32_t adc_ctrl_offset(uint16_t reg)
+{
+    return ((uint32_t)reg) * 4U;
+}
+
+static int adc_ctrl_reg_valid(uint16_t reg)
+{
+    return (reg <= ADC_CTRL_MAX_REG);
+}
+
+static uint32_t adc_ctrl_read(uint16_t reg)
+{
+    return Xil_In32(ADC_CTRL_BASEADDR + adc_ctrl_offset(reg));
+}
+
+static void adc_ctrl_write(uint16_t reg, uint32_t value)
+{
+    Xil_Out32(ADC_CTRL_BASEADDR + adc_ctrl_offset(reg), value);
+}
+
+static uint32_t sanitize_frame_words(uint32_t words)
+{
+    if (words < MIN_FRAME_WORDS)
+    {
+        words = MIN_FRAME_WORDS;
+    }
+
+    if (words > MAX_FRAME_WORDS)
+    {
+        words = MAX_FRAME_WORDS;
+    }
+
+    return words;
+}
+
+static uint32_t sanitize_pretrigger_words(uint32_t words)
+{
+    uint32_t frame_words = sanitize_frame_words(adc_ctrl_read(ADC_CTRL_REG_FRAME_SIZE));
+
+    if (PendingFrameSizeValid)
+    {
+        frame_words = sanitize_frame_words(PendingFrameSizeWords);
+    }
+
+    if (words > frame_words)
+    {
+        words = frame_words;
+    }
+
+    return words;
+}
+
+static uint32_t get_configured_frame_words(void)
+{
+    return sanitize_frame_words(adc_ctrl_read(ADC_CTRL_REG_FRAME_SIZE));
+}
+
+static uint32_t get_reported_frame_words(void)
+{
+    if (PendingFrameSizeValid)
+    {
+        return sanitize_frame_words(PendingFrameSizeWords);
+    }
+
+    return get_configured_frame_words();
+}
+
+static uint32_t get_configured_output_cfg(void)
+{
+    return adc_ctrl_read(ADC_CTRL_REG_OUTPUT_CFG);
+}
+
+static uint32_t get_reported_output_cfg(void)
+{
+    if (PendingOutputCfgValid)
+    {
+        return PendingOutputCfg;
+    }
+
+    return get_configured_output_cfg();
+}
+
+static uint32_t sanitize_sample_decimation(uint32_t value)
+{
+    /*
+     * Zero is not a valid decimation factor.  Preserve the existing
+     * application convention where a requested zero becomes one.
+     */
+    return (value == 0U) ? 1U : value;
+}
+
+static uint32_t get_reported_sample_decimation(void)
+{
+    if (PendingSampleDecimationValid)
+    {
+        return sanitize_sample_decimation(PendingSampleDecimation);
+    }
+
+    return sanitize_sample_decimation(
+        adc_ctrl_read(ADC_CTRL_REG_SAMPLE_DECIMATION)
+    );
+}
+
+static void request_sample_decimation_change(uint32_t value)
+{
+    uint32_t requested = sanitize_sample_decimation(value);
+    uint32_t current = get_reported_sample_decimation();
+
+    if (requested == current)
+    {
+        xil_printf(
+            "Sample decimation unchanged: %lu\r\n",
+            (unsigned long)requested
+        );
+        return;
+    }
+
+    /*
+     * Do not write reg4 while a DMA/frame may be active.  A mid-frame
+     * decimation change can disturb the PL decimation counter and AXI-Stream
+     * frame generation.  Apply it only at the completed-frame boundary.
+     */
+    PendingSampleDecimation = requested;
+    PendingSampleDecimationValid = 1;
+    ReconfigureRequested = 1;
+
+    xil_printf(
+        "Sample decimation change queued: %lu\r\n",
+        (unsigned long)requested
+    );
+}
+
+static void request_frame_size_change(uint32_t frame_words)
+{
+    uint32_t requested_words = sanitize_frame_words(frame_words);
+    uint32_t current_words = get_reported_frame_words();
+
+    if (requested_words == current_words)
+    {
+        xil_printf(
+            "Frame size unchanged: %lu words\r\n",
+            (unsigned long)requested_words
+        );
+        return;
+    }
+
+    PendingFrameSizeWords = requested_words;
+    PendingFrameSizeValid = 1;
+    ReconfigureRequested = 1;
+
+    xil_printf(
+        "Frame size change queued: %lu words\r\n",
+        (unsigned long)PendingFrameSizeWords
+    );
+}
+
+static void request_output_cfg_change(uint32_t output_cfg)
+{
+    uint32_t current_cfg = get_reported_output_cfg();
+
+    if (output_cfg == current_cfg)
+    {
+        xil_printf(
+            "Output cfg unchanged: 0x%08lx\r\n",
+            (unsigned long)output_cfg
+        );
+        return;
+    }
+
+    PendingOutputCfg = output_cfg;
+    PendingOutputCfgValid = 1;
+    ReconfigureRequested = 1;
+
+    xil_printf(
+        "Output cfg change queued: 0x%08lx\r\n",
+        (unsigned long)PendingOutputCfg
+    );
+}
+
+static void apply_pending_length_related_config(void)
+{
+    if (PendingSampleDecimationValid)
+    {
+        adc_ctrl_write(
+            ADC_CTRL_REG_SAMPLE_DECIMATION,
+            sanitize_sample_decimation(PendingSampleDecimation)
+        );
+
+        xil_printf(
+            "Sample decimation change applied: %lu\r\n",
+            (unsigned long)sanitize_sample_decimation(PendingSampleDecimation)
+        );
+
+        PendingSampleDecimationValid = 0;
+    }
+
+    if (PendingFrameSizeValid)
+    {
+        adc_ctrl_write(ADC_CTRL_REG_FRAME_SIZE, sanitize_frame_words(PendingFrameSizeWords));
+
+        xil_printf(
+            "Frame size change applied: %lu words\r\n",
+            (unsigned long)sanitize_frame_words(PendingFrameSizeWords)
+        );
+
+        PendingFrameSizeValid = 0;
+    }
+
+    if (PendingOutputCfgValid)
+    {
+        adc_ctrl_write(ADC_CTRL_REG_OUTPUT_CFG, PendingOutputCfg);
+
+        xil_printf(
+            "Output cfg change applied: 0x%08lx\r\n",
+            (unsigned long)PendingOutputCfg
+        );
+
+        PendingOutputCfgValid = 0;
+    }
+}
+
+static uint32_t frame_words_to_dma_bytes(uint32_t frame_words)
+{
+    uint32_t dma_words = sanitize_frame_words(frame_words);
+    uint32_t output_cfg = get_configured_output_cfg();
+
+    if ((output_cfg & OUTPUT_CFG_APPEND_FOOTER) != 0U)
+    {
+        dma_words += PL_FOOTER_WORDS;
+    }
+
+    return dma_words * 8U;
+}
+
+static uint16_t frame_bytes_to_udp_packets(uint32_t frame_bytes)
+{
+    return (uint16_t)(
+        (frame_bytes + UDP_ADC_PAYLOAD_BYTES - 1U) /
+        UDP_ADC_PAYLOAD_BYTES
+    );
+}
+
+static void initialize_adc_control_ip(void)
+{
+    adc_ctrl_write(ADC_CTRL_REG_CONTROL, 0U);
+    adc_ctrl_write(ADC_CTRL_REG_FRAME_SIZE, DEFAULT_FRAME_WORDS);
+    adc_ctrl_write(ADC_CTRL_REG_PRETRIGGER_SIZE, DEFAULT_PRETRIGGER_WORDS);
+    adc_ctrl_write(ADC_CTRL_REG_SAMPLE_DECIMATION, DEFAULT_SAMPLE_DECIMATION);
+    adc_ctrl_write(ADC_CTRL_REG_TRIGGER_CFG, DEFAULT_TRIGGER_CFG);
+    adc_ctrl_write(ADC_CTRL_REG_SELF_THRESHOLD, DEFAULT_SELF_THRESHOLD);
+    adc_ctrl_write(ADC_CTRL_REG_CHANNEL_MASK, DEFAULT_CHANNEL_MASK);
+    adc_ctrl_write(ADC_CTRL_REG_OUTPUT_CFG, DEFAULT_OUTPUT_CFG);
+    adc_ctrl_write(ADC_CTRL_REG_BASELINE_SHIFT, DEFAULT_BASELINE_SHIFT);
+
+    PendingFrameSizeValid = 0;
+    PendingOutputCfgValid = 0;
+    PendingSampleDecimationValid = 0;
+
+    xil_printf("adc_ctrl initialized at 0x%08lx\r\n", (unsigned long)ADC_CTRL_BASEADDR);
+    xil_printf("frame_size      = %lu words\r\n", (unsigned long)DEFAULT_FRAME_WORDS);
+    xil_printf("pretrigger_size = %lu words\r\n", (unsigned long)DEFAULT_PRETRIGGER_WORDS);
+    xil_printf("trigger_cfg     = 0x%08lx\r\n", (unsigned long)DEFAULT_TRIGGER_CFG);
+    xil_printf("channel_mask    = 0x%08lx\r\n", (unsigned long)DEFAULT_CHANNEL_MASK);
+    xil_printf("output_cfg      = 0x%08lx\r\n", (unsigned long)DEFAULT_OUTPUT_CFG);
+    xil_printf("baseline_shift  = %lu\r\n", (unsigned long)DEFAULT_BASELINE_SHIFT);
+}
 
 /* ============================================================
- * DMA 상태 읽기
+ * Control UDP
+ * ============================================================ */
+
+static int send_control_reply(
+    const ip_addr_t *addr,
+    uint16_t port,
+    uint32_t seq,
+    uint16_t status,
+    uint16_t reg,
+    uint32_t value
+)
+{
+    ControlReply reply;
+    struct pbuf *p;
+    err_t err;
+
+    reply.magic = htonl(CTRL_REPLY_MAGIC);
+    reply.seq = htonl(seq);
+    reply.status = htons(status);
+    reply.reg = htons(reg);
+    reply.value = htonl(value);
+
+    reply.control = htonl(adc_ctrl_read(ADC_CTRL_REG_CONTROL));
+    reply.frame_size = htonl(get_reported_frame_words());
+    reply.pretrigger_size = htonl(adc_ctrl_read(ADC_CTRL_REG_PRETRIGGER_SIZE));
+    reply.sample_decimation = htonl(get_reported_sample_decimation());
+    reply.trigger_cfg = htonl(adc_ctrl_read(ADC_CTRL_REG_TRIGGER_CFG));
+    reply.self_threshold = htonl(adc_ctrl_read(ADC_CTRL_REG_SELF_THRESHOLD));
+    reply.channel_mask = htonl(adc_ctrl_read(ADC_CTRL_REG_CHANNEL_MASK));
+    reply.output_cfg = htonl(get_reported_output_cfg());
+    reply.baseline_shift = htonl(adc_ctrl_read(ADC_CTRL_REG_BASELINE_SHIFT));
+
+    p = pbuf_alloc(PBUF_TRANSPORT, sizeof(reply), PBUF_RAM);
+
+    if (p == NULL)
+    {
+        return XST_FAILURE;
+    }
+
+    err = pbuf_take(p, &reply, sizeof(reply));
+
+    if (err == ERR_OK)
+    {
+        err = udp_sendto(ControlUdpPcb, p, addr, port);
+    }
+
+    pbuf_free(p);
+
+    return (err == ERR_OK) ? XST_SUCCESS : XST_FAILURE;
+}
+
+static uint32_t read_reg_for_reply(uint16_t reg)
+{
+    if (reg == ADC_CTRL_REG_FRAME_SIZE)
+    {
+        return get_reported_frame_words();
+    }
+
+    if (reg == ADC_CTRL_REG_OUTPUT_CFG)
+    {
+        return get_reported_output_cfg();
+    }
+
+    if (reg == ADC_CTRL_REG_SAMPLE_DECIMATION)
+    {
+        return get_reported_sample_decimation();
+    }
+
+    return adc_ctrl_read(reg);
+}
+
+static void write_control_reg(uint16_t reg, uint32_t value)
+{
+    if (reg == ADC_CTRL_REG_FRAME_SIZE)
+    {
+        request_frame_size_change(value);
+        return;
+    }
+
+    if (reg == ADC_CTRL_REG_OUTPUT_CFG)
+    {
+        request_output_cfg_change(value);
+        return;
+    }
+
+    if (reg == ADC_CTRL_REG_SAMPLE_DECIMATION)
+    {
+        request_sample_decimation_change(value);
+        return;
+    }
+
+    if (reg == ADC_CTRL_REG_PRETRIGGER_SIZE)
+    {
+        value = sanitize_pretrigger_words(value);
+    }
+
+    adc_ctrl_write(reg, value);
+}
+
+static void control_udp_recv(
+    void *arg,
+    struct udp_pcb *pcb,
+    struct pbuf *p,
+    const ip_addr_t *addr,
+    u16_t port
+)
+{
+    ControlCommand command;
+    uint32_t magic;
+    uint32_t seq;
+    uint16_t op;
+    uint16_t reg;
+    uint32_t value;
+    uint16_t status;
+
+    (void)arg;
+    (void)pcb;
+
+    if (p == NULL)
+    {
+        return;
+    }
+
+    if (p->tot_len < sizeof(command))
+    {
+        pbuf_free(p);
+        return;
+    }
+
+    pbuf_copy_partial(p, &command, sizeof(command), 0);
+    pbuf_free(p);
+
+    magic = ntohl(command.magic);
+
+    if (magic != CTRL_CMD_MAGIC)
+    {
+        return;
+    }
+
+    seq = ntohl(command.seq);
+    op = ntohs(command.op);
+    reg = ntohs(command.reg);
+    value = ntohl(command.value);
+    status = CTRL_STATUS_OK;
+
+    if (op == CTRL_OP_WRITE)
+    {
+        if (!adc_ctrl_reg_valid(reg))
+        {
+            status = CTRL_STATUS_BAD_REG;
+        }
+        else
+        {
+            write_control_reg(reg, value);
+            value = read_reg_for_reply(reg);
+        }
+    }
+    else if (op == CTRL_OP_READ)
+    {
+        if (!adc_ctrl_reg_valid(reg))
+        {
+            status = CTRL_STATUS_BAD_REG;
+        }
+        else
+        {
+            value = read_reg_for_reply(reg);
+        }
+    }
+    else if (op == CTRL_OP_DUMP)
+    {
+        reg = 0U;
+        value = 0U;
+    }
+    else
+    {
+        status = CTRL_STATUS_BAD_OP;
+    }
+
+    send_control_reply(addr, port, seq, status, reg, value);
+
+    xil_printf(
+        "CTRL op=%u reg=%u value=0x%08lx status=%u\r\n",
+        op,
+        reg,
+        (unsigned long)value,
+        status
+    );
+}
+
+/* ============================================================
+ * DMA helpers
  * ============================================================ */
 
 static u32 read_dma_status(void)
@@ -251,43 +755,47 @@ static u32 read_dma_status(void)
     );
 }
 
-
 static void print_dma_status(void)
 {
-    u32 status = read_dma_status();
-
-    xil_printf(
-        "S2MM_DMASR = 0x%08lx\r\n",
-        (unsigned long)status
-    );
+    xil_printf("S2MM_DMASR = 0x%08lx\r\n", (unsigned long)read_dma_status());
 }
-
-
-/* ============================================================
- * DMA error 확인
- *
- * DMASR:
- * bit 4 = DMAIntErr
- * bit 5 = DMASlvErr
- * bit 6 = DMADecErr
- * ============================================================ */
 
 static int dma_has_error(void)
 {
     u32 status = read_dma_status();
 
-    if ((status & 0x00000070U) != 0U)
-    {
-        return 1;
-    }
-
-    return 0;
+    return ((status & 0x00000070U) != 0U) ? 1 : 0;
 }
 
+static int reset_dma_engine(void)
+{
+    uint32_t timeout;
 
-/* ============================================================
- * DMA 초기화
- * ============================================================ */
+    XAxiDma_Reset(&AxiDma);
+
+    timeout = 1000000U;
+
+    while (!XAxiDma_ResetIsDone(&AxiDma))
+    {
+        if (timeout == 0U)
+        {
+            xil_printf("ERROR: DMA reset timeout\r\n");
+            return XST_FAILURE;
+        }
+
+        timeout--;
+    }
+
+    XAxiDma_IntrDisable(
+        &AxiDma,
+        XAXIDMA_IRQ_ALL_MASK,
+        XAXIDMA_DEVICE_TO_DMA
+    );
+
+    xil_printf("DMA reset complete\r\n");
+
+    return XST_SUCCESS;
+}
 
 static int initialize_dma(void)
 {
@@ -298,33 +806,21 @@ static int initialize_dma(void)
 
     if (cfg == NULL)
     {
-        xil_printf(
-            "ERROR: DMA configuration not found\r\n"
-        );
-
+        xil_printf("ERROR: DMA configuration not found\r\n");
         return XST_FAILURE;
     }
 
-    status = XAxiDma_CfgInitialize(
-        &AxiDma,
-        cfg
-    );
+    status = XAxiDma_CfgInitialize(&AxiDma, cfg);
 
     if (status != XST_SUCCESS)
     {
-        xil_printf(
-            "ERROR: DMA initialization failed\r\n"
-        );
-
+        xil_printf("ERROR: DMA initialization failed\r\n");
         return XST_FAILURE;
     }
 
     if (XAxiDma_HasSg(&AxiDma))
     {
-        xil_printf(
-            "ERROR: AXI DMA is Scatter-Gather mode\r\n"
-        );
-
+        xil_printf("ERROR: AXI DMA must be simple mode, not scatter-gather mode\r\n");
         return XST_FAILURE;
     }
 
@@ -335,107 +831,72 @@ static int initialize_dma(void)
     );
 
     xil_printf("DMA initialized\r\n");
-
-    xil_printf(
-        "FRAME_WORDS = %lu\r\n",
-        (unsigned long)FRAME_WORDS
-    );
-
-    xil_printf(
-        "FRAME_BYTES = %lu\r\n",
-        (unsigned long)FRAME_BYTES
-    );
+    xil_printf("MAX_FRAME_WORDS = %lu\r\n", (unsigned long)MAX_FRAME_WORDS);
+    xil_printf("MAX_DMA_BYTES   = %lu\r\n", (unsigned long)MAX_DMA_BYTES);
+    xil_printf("RX buffer 0     = 0x%08lx\r\n", (unsigned long)RX_BUFFER0_BASE);
+    xil_printf("RX buffer 1     = 0x%08lx\r\n", (unsigned long)RX_BUFFER1_BASE);
 
     return XST_SUCCESS;
 }
 
-
-/* ============================================================
- * 지정된 버퍼에 DMA 수신 시작
- * ============================================================ */
-
-static int start_dma_receive(uint64_t *buffer)
+static int start_dma_receive(uint64_t *buffer, uint32_t frame_bytes)
 {
     int status;
 
-    /*
-     * DMA가 쓸 메모리에 남아 있을 수 있는 cache line 무효화
-     */
-    Xil_DCacheInvalidateRange(
-        (UINTPTR)buffer,
-        FRAME_BYTES
-    );
+    if (frame_bytes > MAX_DMA_BYTES)
+    {
+        xil_printf("ERROR: requested DMA length is too large: %lu\r\n", (unsigned long)frame_bytes);
+        return XST_FAILURE;
+    }
+
+    Xil_DCacheInvalidateRange((UINTPTR)buffer, frame_bytes);
 
     status = XAxiDma_SimpleTransfer(
         &AxiDma,
         (UINTPTR)buffer,
-        FRAME_BYTES,
+        frame_bytes,
         XAXIDMA_DEVICE_TO_DMA
     );
 
     if (status != XST_SUCCESS)
     {
-        xil_printf(
-            "ERROR: DMA transfer start failed\r\n"
-        );
-
+        xil_printf("ERROR: DMA transfer start failed\r\n");
         print_dma_status();
-
         return XST_FAILURE;
     }
 
     return XST_SUCCESS;
 }
 
-
-/* ============================================================
- * DMA 완료 여부
- * ============================================================ */
-
 static int dma_receive_complete(void)
 {
-    if (XAxiDma_Busy(
-            &AxiDma,
-            XAXIDMA_DEVICE_TO_DMA
-        ))
-    {
-        return 0;
-    }
-
-    return 1;
+    return XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA) ? 0 : 1;
 }
-
-
-/* ============================================================
- * DMA 완료 대기
- *
- * 대기 중에도 Ethernet RX와 lwIP timer 처리
- * ============================================================ */
 
 static int wait_for_dma_complete(void)
 {
     while (!dma_receive_complete())
     {
+        /*
+         * Do not abort an armed DMA merely because a configuration update
+         * arrived.  The current frame is allowed to complete, and pending
+         * length-related settings are applied before the next DMA is armed.
+         */
         service_network();
     }
 
     if (dma_has_error())
     {
-        xil_printf(
-            "ERROR: DMA transfer completed with error\r\n"
-        );
-
+        xil_printf("ERROR: DMA transfer completed with error\r\n");
         print_dma_status();
-
         return XST_FAILURE;
     }
 
     return XST_SUCCESS;
 }
 
-
 /* ============================================================
- * UDP 초기화
+ * UDP setup and transmission
  * ============================================================ */
 
 static int initialize_udp(void)
@@ -446,37 +907,19 @@ static int initialize_udp(void)
 
     if (UdpPcb == NULL)
     {
-        xil_printf(
-            "ERROR: udp_new failed\r\n"
-        );
-
+        xil_printf("ERROR: udp_new failed\r\n");
         return XST_FAILURE;
     }
 
-    IP4_ADDR(
-        &PcIpAddr,
-        PC_IP0,
-        PC_IP1,
-        PC_IP2,
-        PC_IP3
-    );
+    IP4_ADDR(&PcIpAddr, PC_IP0, PC_IP1, PC_IP2, PC_IP3);
 
-    err = udp_connect(
-        UdpPcb,
-        &PcIpAddr,
-        PC_UDP_PORT
-    );
+    err = udp_connect(UdpPcb, &PcIpAddr, PC_UDP_PORT);
 
     if (err != ERR_OK)
     {
-        xil_printf(
-            "ERROR: udp_connect failed: %d\r\n",
-            err
-        );
-
+        xil_printf("ERROR: udp_connect failed: %d\r\n", err);
         udp_remove(UdpPcb);
         UdpPcb = NULL;
-
         return XST_FAILURE;
     }
 
@@ -490,20 +933,41 @@ static int initialize_udp(void)
     );
 
     xil_printf(
-        "UDP packets per frame = %lu\r\n",
-        (unsigned long)TOTAL_UDP_PACKETS
+        "UDP max packets per frame = %lu\r\n",
+        (unsigned long)frame_bytes_to_udp_packets(MAX_DMA_BYTES)
     );
 
     return XST_SUCCESS;
 }
 
+static int initialize_control_udp(void)
+{
+    err_t err;
 
-/* ============================================================
- * 첫 ADC 프레임 전송 전 PC의 ARP 정보 준비
- *
- * 첫 udp_send()에서 ARP 해석이 시작되면 앞쪽 UDP 패킷이
- * 유실될 수 있으므로 DMA를 arm하기 전에 ARP 요청을 보낸다.
- * ============================================================ */
+    ControlUdpPcb = udp_new();
+
+    if (ControlUdpPcb == NULL)
+    {
+        xil_printf("ERROR: control udp_new failed\r\n");
+        return XST_FAILURE;
+    }
+
+    err = udp_bind(ControlUdpPcb, IP_ADDR_ANY, CONTROL_UDP_PORT);
+
+    if (err != ERR_OK)
+    {
+        xil_printf("ERROR: control udp_bind failed: %d\r\n", err);
+        udp_remove(ControlUdpPcb);
+        ControlUdpPcb = NULL;
+        return XST_FAILURE;
+    }
+
+    udp_recv(ControlUdpPcb, control_udp_recv, NULL);
+
+    xil_printf("Control UDP listening on port %lu\r\n", (unsigned long)CONTROL_UDP_PORT);
+
+    return XST_SUCCESS;
+}
 
 static void prepare_pc_arp(void)
 {
@@ -512,20 +976,13 @@ static void prepare_pc_arp(void)
 
     xil_printf("Resolving PC MAC address...\r\n");
 
-    err = etharp_request(
-        echo_netif,
-        ip_2_ip4(&PcIpAddr)
-    );
+    err = etharp_request(echo_netif, ip_2_ip4(&PcIpAddr));
 
     if (err != ERR_OK)
     {
-        xil_printf(
-            "WARNING: ARP request failed: %d\r\n",
-            err
-        );
+        xil_printf("WARNING: ARP request failed: %d\r\n", err);
     }
 
-    /* ARP 응답을 받을 수 있도록 1초 동안 Ethernet 처리 */
     for (elapsed_ms = 0U; elapsed_ms < 1000U; elapsed_ms++)
     {
         service_network();
@@ -535,206 +992,161 @@ static void prepare_pc_arp(void)
     xil_printf("ARP preparation complete\r\n");
 }
 
-
-/* ============================================================
- * UDP 패킷 한 개 전송
- * ============================================================ */
-
 static int send_udp_packet(
     uint32_t frame_id,
     uint16_t packet_index,
     uint16_t total_packets,
+    uint32_t frame_bytes,
     const uint8_t *payload,
     uint16_t payload_bytes
 )
 {
     UdpAdcHeader header;
-
     struct pbuf *p;
     err_t err;
     uint32_t retry_count;
-
     uint16_t packet_bytes;
 
-    /*
-     * 헤더는 network byte order
-     */
-    header.magic =
-        htonl(UDP_MAGIC);
+    header.magic = htonl(UDP_MAGIC);
+    header.frame_id = htonl(frame_id);
+    header.packet_index = htons(packet_index);
+    header.total_packets = htons(total_packets);
+    header.payload_bytes = htons(payload_bytes);
+    header.reserved = htons(0U);
+    header.frame_bytes = htonl(frame_bytes);
 
-    header.frame_id =
-        htonl(frame_id);
+    memcpy(UdpPacketBuffer, &header, sizeof(header));
+    memcpy(UdpPacketBuffer + sizeof(header), payload, payload_bytes);
 
-    header.packet_index =
-        htons(packet_index);
+    packet_bytes = (uint16_t)(sizeof(header) + payload_bytes);
 
-    header.total_packets =
-        htons(total_packets);
+    p = NULL;
 
-    header.payload_bytes =
-        htons(payload_bytes);
+    for (retry_count = 0U;
+         retry_count < UDP_TX_RETRY_COUNT;
+         retry_count++)
+    {
+        p = pbuf_alloc(PBUF_TRANSPORT, packet_bytes, PBUF_RAM);
 
-    header.reserved =
-        htons(0U);
+        if (p != NULL)
+        {
+            break;
+        }
 
-    header.frame_bytes =
-        htonl(FRAME_BYTES);
-
-    memcpy(
-        UdpPacketBuffer,
-        &header,
-        sizeof(header)
-    );
-
-    memcpy(
-        UdpPacketBuffer + sizeof(header),
-        payload,
-        payload_bytes
-    );
-
-    packet_bytes =
-        (uint16_t)(sizeof(header) + payload_bytes);
-
-    p = pbuf_alloc(
-        PBUF_TRANSPORT,
-        packet_bytes,
-        PBUF_RAM
-    );
+        service_network();
+        usleep(UDP_TX_RETRY_DELAY_US);
+    }
 
     if (p == NULL)
     {
         xil_printf(
-            "ERROR: pbuf_alloc failed\r\n"
+            "ERROR: pbuf_alloc timeout at packet %u after %lu retries\r\n",
+            packet_index,
+            (unsigned long)UDP_TX_RETRY_COUNT
         );
-
         return XST_FAILURE;
     }
 
-    err = pbuf_take(
-        p,
-        UdpPacketBuffer,
-        packet_bytes
-    );
+    err = pbuf_take(p, UdpPacketBuffer, packet_bytes);
 
     if (err != ERR_OK)
     {
-        xil_printf(
-            "ERROR: pbuf_take failed: %d\r\n",
-            err
-        );
-
+        xil_printf("ERROR: pbuf_take failed: %d\r\n", err);
         pbuf_free(p);
-
         return XST_FAILURE;
     }
 
     retry_count = 0U;
 
-    do
+    while (1)
     {
-        err = udp_send(
-            UdpPcb,
-            p
-        );
+        err = udp_send(UdpPcb, p);
+
+        if (err == ERR_OK)
+        {
+            break;
+        }
 
         if (err != ERR_MEM)
+        {
             break;
+        }
 
-        /* TX descriptor가 반환될 때까지 Ethernet 처리 후 재시도 */
         service_network();
         usleep(UDP_TX_RETRY_DELAY_US);
+
         retry_count++;
 
-    } while (retry_count < UDP_TX_RETRY_COUNT);
+        if (retry_count >= UDP_TX_RETRY_COUNT)
+        {
+            xil_printf(
+                "ERROR: udp_send ERR_MEM timeout at packet %u after %lu retries\r\n",
+                packet_index,
+                (unsigned long)retry_count
+            );
+            break;
+        }
+    }
 
     pbuf_free(p);
 
     if (err != ERR_OK)
     {
-        xil_printf(
-            "ERROR: udp_send failed: %d\r\n",
-            err
-        );
-
+        xil_printf("ERROR: udp_send failed: %d\r\n", err);
         return XST_FAILURE;
     }
 
     return XST_SUCCESS;
 }
 
-
-/* ============================================================
- * 한 DMA 프레임을 UDP 여러 패킷으로 전송
- * ============================================================ */
-
-static int send_adc_frame(
-    uint64_t *buffer,
-    uint32_t frame_id
-)
+static int send_adc_frame(uint64_t *buffer, uint32_t frame_id, uint32_t frame_bytes)
 {
-    const uint8_t *frame_data =
-        (const uint8_t *)buffer;
-
+    const uint8_t *frame_data = (const uint8_t *)buffer;
     uint32_t offset = 0U;
     uint32_t remaining;
-
     uint16_t packet_index;
     uint16_t payload_bytes;
+    const uint16_t total_packets = frame_bytes_to_udp_packets(frame_bytes);
 
-    const uint16_t total_packets =
-        (uint16_t)TOTAL_UDP_PACKETS;
-
-    for (
-        packet_index = 0U;
-        packet_index < total_packets;
-        packet_index++
-    )
+    for (packet_index = 0U; packet_index < total_packets; packet_index++)
     {
-        remaining =
-            FRAME_BYTES - offset;
+        remaining = frame_bytes - offset;
 
         if (remaining > UDP_ADC_PAYLOAD_BYTES)
         {
-            payload_bytes =
-                (uint16_t)UDP_ADC_PAYLOAD_BYTES;
+            payload_bytes = (uint16_t)UDP_ADC_PAYLOAD_BYTES;
         }
         else
         {
-            payload_bytes =
-                (uint16_t)remaining;
+            payload_bytes = (uint16_t)remaining;
         }
 
         if (send_udp_packet(
                 frame_id,
                 packet_index,
                 total_packets,
+                frame_bytes,
                 frame_data + offset,
                 payload_bytes
             ) != XST_SUCCESS)
         {
-            xil_printf(
-                "ERROR: UDP packet %u transmission failed\r\n",
-                packet_index
-            );
-
+            xil_printf("ERROR: UDP packet %u transmission failed\r\n", packet_index);
             return XST_FAILURE;
         }
 
         offset += payload_bytes;
 
-        /*
-         * Ethernet RX 및 lwIP timer 지속 처리
-         */
-        service_network();
+#if UDP_PACKET_GAP_US > 0U
         usleep(UDP_PACKET_GAP_US);
+#endif
+        service_network();
     }
 
     return XST_SUCCESS;
 }
 
-
 /* ============================================================
- * Ethernet 초기화
+ * Ethernet initialization
  * ============================================================ */
 
 static int initialize_ethernet(void)
@@ -753,37 +1165,16 @@ static int initialize_ethernet(void)
         0x02
     };
 
-    echo_netif =
-        &ServerNetif;
+    echo_netif = &ServerNetif;
 
-    IP4_ADDR(
-        &ip_address,
-        BOARD_IP0,
-        BOARD_IP1,
-        BOARD_IP2,
-        BOARD_IP3
-    );
-
-    IP4_ADDR(
-        &netmask,
-        BOARD_NETMASK0,
-        BOARD_NETMASK1,
-        BOARD_NETMASK2,
-        BOARD_NETMASK3
-    );
-
-    IP4_ADDR(
-        &gateway,
-        BOARD_GATEWAY0,
-        BOARD_GATEWAY1,
-        BOARD_GATEWAY2,
-        BOARD_GATEWAY3
-    );
+    IP4_ADDR(&ip_address, BOARD_IP0, BOARD_IP1, BOARD_IP2, BOARD_IP3);
+    IP4_ADDR(&netmask, BOARD_NETMASK0, BOARD_NETMASK1, BOARD_NETMASK2, BOARD_NETMASK3);
+    IP4_ADDR(&gateway, BOARD_GATEWAY0, BOARD_GATEWAY1, BOARD_GATEWAY2, BOARD_GATEWAY3);
 
     lwip_init();
 
     if (!xemac_add(
-    		echo_netif,
+            echo_netif,
             &ip_address,
             &netmask,
             &gateway,
@@ -791,74 +1182,48 @@ static int initialize_ethernet(void)
             PLATFORM_EMAC_BASEADDR
         ))
     {
-        xil_printf(
-            "ERROR: adding Ethernet interface failed\r\n"
-        );
-
+        xil_printf("ERROR: adding Ethernet interface failed\r\n");
         return XST_FAILURE;
     }
 
-    netif_set_default(
-    		echo_netif
-    );
-
+    netif_set_default(echo_netif);
     platform_enable_interrupts();
+    netif_set_up(echo_netif);
 
-    netif_set_up(
-    		echo_netif
-    );
-
-    print_ip_address(
-        "Board IP : ",
-        &ip_address
-    );
-
-    print_ip_address(
-        "Netmask  : ",
-        &netmask
-    );
-
-    print_ip_address(
-        "Gateway  : ",
-        &gateway
-    );
+    print_ip_address("Board IP : ", &ip_address);
+    print_ip_address("Netmask  : ", &netmask);
+    print_ip_address("Gateway  : ", &gateway);
 
     return XST_SUCCESS;
 }
 
-
 /* ============================================================
- * main
+ * Main
  * ============================================================ */
 
 int main(void)
 {
     int status;
-
     int active_rx_buffer;
     int completed_buffer;
-
+    uint32_t active_frame_words;
+    uint32_t active_frame_bytes;
+    uint32_t completed_frame_bytes;
     uint32_t completed_frame_id;
 
     init_platform();
 
-    xil_printf(
-        "\r\n"
-        "========================================\r\n"
-        " ADC Trigger DMA UDP Ping-Pong\r\n"
-        "========================================\r\n"
-    );
+    xil_printf("\r\n");
+    xil_printf("========================================\r\n");
+    xil_printf(" ADC Trigger DMA UDP Control Application\r\n");
+    xil_printf("========================================\r\n");
 
     status = initialize_ethernet();
 
     if (status != XST_SUCCESS)
     {
-        xil_printf(
-            "Ethernet initialization failed\r\n"
-        );
-
+        xil_printf("Ethernet initialization failed\r\n");
         cleanup_platform();
-
         return -1;
     }
 
@@ -866,150 +1231,176 @@ int main(void)
 
     if (status != XST_SUCCESS)
     {
-        xil_printf(
-            "UDP initialization failed\r\n"
-        );
-
+        xil_printf("UDP initialization failed\r\n");
         cleanup_platform();
-
         return -1;
     }
+
+    status = initialize_control_udp();
+
+    if (status != XST_SUCCESS)
+    {
+        xil_printf("Control UDP initialization failed\r\n");
+        udp_remove(UdpPcb);
+        cleanup_platform();
+        return -1;
+    }
+
+    initialize_adc_control_ip();
 
     status = initialize_dma();
 
     if (status != XST_SUCCESS)
     {
-        xil_printf(
-            "DMA initialization failed\r\n"
-        );
-
+        xil_printf("DMA initialization failed\r\n");
         udp_remove(UdpPcb);
-
+        udp_remove(ControlUdpPcb);
         cleanup_platform();
-
         return -1;
     }
 
-    /* 첫 프레임 UDP 패킷 유실 방지를 위해 DMA보다 먼저 실행 */
     prepare_pc_arp();
 
-    /*
-     * 첫 번째 DMA는 Buffer 0에서 시작
-     */
     active_rx_buffer = 0;
+    active_frame_words = get_configured_frame_words();
+    active_frame_bytes = frame_words_to_dma_bytes(active_frame_words);
 
-    status = start_dma_receive(
-        RxBuffer[active_rx_buffer]
-    );
+    status = start_dma_receive(RxBuffer[active_rx_buffer], active_frame_bytes);
 
     if (status != XST_SUCCESS)
     {
-        xil_printf(
-            "First DMA start failed\r\n"
-        );
-
+        xil_printf("First DMA start failed\r\n");
         udp_remove(UdpPcb);
-
+        udp_remove(ControlUdpPcb);
         cleanup_platform();
-
         return -1;
     }
 
     xil_printf(
-        "\r\nWaiting for first trigger frame...\r\n"
+        "DMA armed on buffer %d for %lu bytes, waiting for trigger...\r\n",
+        active_rx_buffer,
+        (unsigned long)active_frame_bytes
     );
 
     while (1)
     {
-        /*
-         * 현재 DMA가 한 프레임을 수신할 때까지 대기
-         */
         status = wait_for_dma_complete();
 
         if (status != XST_SUCCESS)
         {
+            xil_printf("WARNING: DMA receive failed; resetting DMA and arming next buffer\r\n");
+
+            if (reset_dma_engine() != XST_SUCCESS)
+            {
+                break;
+            }
+
+            active_rx_buffer ^= 1;
+
+            if (ReconfigureRequested)
+            {
+                apply_pending_length_related_config();
+                ReconfigureRequested = 0;
+            }
+
+            active_frame_words = get_configured_frame_words();
+            active_frame_bytes = frame_words_to_dma_bytes(active_frame_words);
+
+            if (start_dma_receive(RxBuffer[active_rx_buffer], active_frame_bytes) != XST_SUCCESS)
+            {
+                xil_printf("WARNING: DMA restart failed; resetting and retrying once\r\n");
+
+                if (reset_dma_engine() != XST_SUCCESS ||
+                    start_dma_receive(RxBuffer[active_rx_buffer], active_frame_bytes) != XST_SUCCESS)
+                {
+                    xil_printf("ERROR: DMA restart retry failed\r\n");
+                    break;
+                }
+            }
+
             xil_printf(
-                "DMA receive failed\r\n"
+                "DMA re-armed on buffer %d for %lu bytes after DMA error\r\n",
+                active_rx_buffer,
+                (unsigned long)active_frame_bytes
             );
 
-            break;
+            continue;
         }
 
-        /*
-         * 방금 완료된 버퍼 번호 보존
-         */
-        completed_buffer =
-            active_rx_buffer;
+        completed_buffer = active_rx_buffer;
+        completed_frame_bytes = active_frame_bytes;
 
-        /*
-         * DMA가 쓴 메모리를 CPU가 읽기 전에 invalidate
-         */
         Xil_DCacheInvalidateRange(
             (UINTPTR)RxBuffer[completed_buffer],
-            FRAME_BYTES
+            completed_frame_bytes
         );
 
-        /*
-         * 완료 프레임 번호 증가
-         */
         FrameId++;
+        completed_frame_id = FrameId;
 
-        completed_frame_id =
-            FrameId;
-
-        /*
-         * 완료된 프레임 하나만 UDP로 전송
-         * 이 시점에는 다음 DMA를 시작하지 않았으므로 holdoff 상태
-         */
         status = send_adc_frame(
             RxBuffer[completed_buffer],
-            completed_frame_id
+            completed_frame_id,
+            completed_frame_bytes
         );
 
         if (status != XST_SUCCESS)
         {
             xil_printf(
-                "ERROR: frame UDP transmission failed\r\n"
+                "WARNING: frame %lu UDP transmission failed; next DMA will still be armed\r\n",
+                (unsigned long)completed_frame_id
             );
-
-            break;
         }
 
         xil_printf(
-            "Frame %lu sent, ignoring triggers for %lu seconds...\r\n",
+            "Frame %lu handled (%lu bytes); arming next DMA\r\n",
             (unsigned long)completed_frame_id,
-            (unsigned long)TRIGGER_HOLDOFF_SECONDS
+            (unsigned long)completed_frame_bytes
         );
 
-        wait_trigger_holdoff();
+        service_network();
 
-        /* holdoff 종료 후 반대쪽 버퍼에 다음 한 프레임 수신 arm */
         active_rx_buffer ^= 1;
 
-        status = start_dma_receive(
-            RxBuffer[active_rx_buffer]
-        );
+        if (ReconfigureRequested)
+        {
+            xil_printf("Applying pending configuration before next DMA\r\n");
+            apply_pending_length_related_config();
+            ReconfigureRequested = 0;
+        }
+
+        active_frame_words = get_configured_frame_words();
+        active_frame_bytes = frame_words_to_dma_bytes(active_frame_words);
+
+        status = start_dma_receive(RxBuffer[active_rx_buffer], active_frame_bytes);
 
         if (status != XST_SUCCESS)
         {
-            xil_printf(
-                "ERROR: next DMA start failed\r\n"
-            );
+            xil_printf("WARNING: next DMA start failed; resetting and retrying once\r\n");
 
-            break;
+            if (reset_dma_engine() != XST_SUCCESS ||
+                start_dma_receive(RxBuffer[active_rx_buffer], active_frame_bytes) != XST_SUCCESS)
+            {
+                xil_printf("ERROR: next DMA start retry failed\r\n");
+                break;
+            }
         }
 
         xil_printf(
-            "DMA armed on buffer %d, waiting for next trigger...\r\n",
-            active_rx_buffer
+            "DMA armed on buffer %d for %lu bytes, waiting for next trigger...\r\n",
+            active_rx_buffer,
+            (unsigned long)active_frame_bytes
         );
     }
 
     if (UdpPcb != NULL)
     {
-        udp_remove(
-            UdpPcb
-        );
+        udp_remove(UdpPcb);
+    }
+
+    if (ControlUdpPcb != NULL)
+    {
+        udp_remove(ControlUdpPcb);
     }
 
     cleanup_platform();

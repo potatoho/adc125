@@ -94,3 +94,5 @@ set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets IBUFDS_adc2_clk/O]
 
 set_property PACKAGE_PIN G8       [get_ports trigger_in] ;# Bank  87 VCCO - VCC3V3   - IO_L12N_AD0N_87
 set_property IOSTANDARD  LVCMOS33 [get_ports trigger_in] ;# Bank  87 VCCO - VCC3V3   - IO_L12N_AD0N_87
+
+set_property UNAVAILABLE_DURING_CALIBRATION TRUE [get_ports adc2_clk_p]
