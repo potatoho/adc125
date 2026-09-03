@@ -1199,6 +1199,31 @@ static void set_pl_acquisition_enable(int enabled)
     adc_ctrl_write(ADC_CTRL_REG_CONTROL, control_value);
 }
 
+static int get_pl_acquisition_enable(void)
+{
+    if (AdcCtrlRegs == NULL)
+    {
+        return 0;
+    }
+
+    return ((adc_ctrl_read(ADC_CTRL_REG_CONTROL) & CONTROL_ACQUISITION_ENABLE) != 0U) ? 1 : 0;
+}
+
+static void hold_pl_acquisition_idle(void)
+{
+    uint32_t control_value;
+
+    if (AdcCtrlRegs == NULL)
+    {
+        return;
+    }
+
+    control_value = adc_ctrl_read(ADC_CTRL_REG_CONTROL);
+    control_value &= ~(CONTROL_ACQUISITION_ENABLE | CONTROL_ACQUISITION_ARM | CONTROL_SOFT_TRIGGER);
+    adc_ctrl_write(ADC_CTRL_REG_CONTROL, control_value);
+    sleep_us(2U);
+}
+
 static void pulse_acquisition_arm(void)
 {
     uint32_t control_value;
@@ -1720,6 +1745,7 @@ int main(int argc, char **argv)
     uint32_t active_frame_bytes;
     uint32_t completed_frame_bytes;
     uint32_t completed_frame_id;
+    int restore_acquisition_enable = 0;
 
     if (parse_args(argc, argv) != APP_SUCCESS)
     {
@@ -1807,6 +1833,8 @@ int main(int argc, char **argv)
             printf("Software reset requested; resetting DMA and PL capture path\n");
 
             SoftwareResetRequested = 0;
+            restore_acquisition_enable = get_pl_acquisition_enable();
+            hold_pl_acquisition_idle();
 
             if (reset_dma_engine() != APP_SUCCESS)
             {
@@ -1814,11 +1842,13 @@ int main(int argc, char **argv)
             }
 
             pulse_pl_software_reset();
+            pulse_fifo_alarm_clear();
 
             if (ReconfigureRequested)
             {
                 apply_pending_length_related_config();
                 ReconfigureRequested = 0;
+                SoftwareResetRequested = 0;
             }
 
             active_rx_buffer ^= 1;
@@ -1829,6 +1859,12 @@ int main(int argc, char **argv)
             {
                 printf("ERROR: DMA re-arm failed after software reset\n");
                 break;
+            }
+
+            if (restore_acquisition_enable)
+            {
+                set_pl_acquisition_enable(1);
+                restore_acquisition_enable = 0;
             }
 
             pulse_acquisition_arm();
@@ -1851,10 +1887,16 @@ int main(int argc, char **argv)
 
             printf("WARNING: DMA receive failed; resetting DMA and arming next buffer\n");
 
+            restore_acquisition_enable = get_pl_acquisition_enable();
+            hold_pl_acquisition_idle();
+
             if (reset_dma_engine() != APP_SUCCESS)
             {
                 break;
             }
+
+            pulse_pl_software_reset();
+            pulse_fifo_alarm_clear();
 
             active_rx_buffer ^= 1;
 
@@ -1862,6 +1904,7 @@ int main(int argc, char **argv)
             {
                 apply_pending_length_related_config();
                 ReconfigureRequested = 0;
+                SoftwareResetRequested = 0;
             }
 
             active_frame_words = get_configured_frame_words();
@@ -1871,12 +1914,26 @@ int main(int argc, char **argv)
             {
                 printf("WARNING: DMA restart failed; resetting and retrying once\n");
 
-                if (reset_dma_engine() != APP_SUCCESS ||
-                    start_dma_receive(active_rx_buffer, active_frame_bytes) != APP_SUCCESS)
+                if (reset_dma_engine() != APP_SUCCESS)
                 {
                     printf("ERROR: DMA restart retry failed\n");
                     break;
                 }
+
+                pulse_pl_software_reset();
+                pulse_fifo_alarm_clear();
+
+                if (start_dma_receive(active_rx_buffer, active_frame_bytes) != APP_SUCCESS)
+                {
+                    printf("ERROR: DMA restart retry failed\n");
+                    break;
+                }
+            }
+
+            if (restore_acquisition_enable)
+            {
+                set_pl_acquisition_enable(1);
+                restore_acquisition_enable = 0;
             }
 
             pulse_acquisition_arm();
@@ -1911,12 +1968,16 @@ int main(int argc, char **argv)
         {
             printf("Reconfiguration pending; resetting DMA and PL before next arm\n");
 
+            restore_acquisition_enable = get_pl_acquisition_enable();
+            hold_pl_acquisition_idle();
+
             if (reset_dma_engine() != APP_SUCCESS)
             {
                 break;
             }
 
             pulse_pl_software_reset();
+            pulse_fifo_alarm_clear();
 
             apply_pending_length_related_config();
             ReconfigureRequested = 0;
@@ -1932,12 +1993,32 @@ int main(int argc, char **argv)
         {
             printf("WARNING: next DMA start failed; resetting and retrying once\n");
 
-            if (reset_dma_engine() != APP_SUCCESS ||
-                start_dma_receive(active_rx_buffer, active_frame_bytes) != APP_SUCCESS)
+            if (!restore_acquisition_enable)
+            {
+                restore_acquisition_enable = get_pl_acquisition_enable();
+                hold_pl_acquisition_idle();
+            }
+
+            if (reset_dma_engine() != APP_SUCCESS)
             {
                 printf("ERROR: next DMA start retry failed\n");
                 break;
             }
+
+            pulse_pl_software_reset();
+            pulse_fifo_alarm_clear();
+
+            if (start_dma_receive(active_rx_buffer, active_frame_bytes) != APP_SUCCESS)
+            {
+                printf("ERROR: next DMA start retry failed\n");
+                break;
+            }
+        }
+
+        if (restore_acquisition_enable)
+        {
+            set_pl_acquisition_enable(1);
+            restore_acquisition_enable = 0;
         }
 
         pulse_acquisition_arm();
@@ -1977,8 +2058,15 @@ int main(int argc, char **argv)
             if (ReconfigureRequested)
             {
                 printf("Applying pending configuration before UDP recovery re-arm\n");
+
+                restore_acquisition_enable = get_pl_acquisition_enable();
+                hold_pl_acquisition_idle();
+                pulse_pl_software_reset();
+                pulse_fifo_alarm_clear();
+
                 apply_pending_length_related_config();
                 ReconfigureRequested = 0;
+                SoftwareResetRequested = 0;
             }
 
             active_frame_words = get_configured_frame_words();
@@ -1994,6 +2082,12 @@ int main(int argc, char **argv)
                     printf("ERROR: DMA re-arm retry failed after UDP failure\n");
                     break;
                 }
+            }
+
+            if (restore_acquisition_enable)
+            {
+                set_pl_acquisition_enable(1);
+                restore_acquisition_enable = 0;
             }
 
             pulse_acquisition_arm();
